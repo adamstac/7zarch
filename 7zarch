@@ -1,0 +1,1751 @@
+#!/bin/bash
+
+# create_7z - A script to create 7z archives with optimized compression settings
+#
+# Usage:
+#   create_7z <directory>                              # Create archive in same location as source
+#   create_7z <directory> -o <output_dir>              # Create archive in specified output directory
+#   create_7z --files-from <manifest.txt>              # Process multiple directories from manifest file
+#   create_7z --files-from <manifest.txt> -o <out_dir> # Process manifest with custom output directory
+#   create_7z -c <level> <directory>                   # Set compression level (0-9, default: 9)
+#   create_7z --dry-run <directory>                    # Show what would be done without creating archives
+#   create_7z --info <archive.7z>                     # Show information about existing archive
+#   create_7z --test <archive.7z>                     # Test archive integrity
+#   create_7z -h|--help                               # Show this help message
+#
+# Options:
+#   -o, --output DIR       Output directory for archives
+#   -c, --compression N    Compression level (0-9, default: 9)
+#   -t, --threads N        Number of CPU threads to use (default: all available)
+#   --files-from FILE      Read list of directories from manifest file
+#   --dry-run             Show operations without executing them
+#   --verify              Test archive integrity after creation
+#   --info FILE           Show information about existing archive
+#   --test FILE           Test archive integrity only
+#   -h, --help            Show help message
+#   -v, --verbose         Enable verbose output
+#
+# Examples:
+#   create_7z /path/to/folder
+#   create_7z /path/to/folder -o /backup/archives
+#   create_7z --files-from directories.txt -c 5 -t 4
+#   create_7z --dry-run /path/to/folder -t 2
+#   create_7z --info /path/to/archive.7z
+#   create_7z --verify /path/to/folder
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+# Global variable to cache CPU core count
+CPU_CORES=""
+
+# Function to detect CPU cores
+get_cpu_cores() {
+  if [[ -n "$CPU_CORES" ]]; then
+    echo "$CPU_CORES"
+    return
+  fi
+  
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    CPU_CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo "unknown")
+  elif [[ -f /proc/cpuinfo ]]; then
+    CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "unknown")
+  else
+    CPU_CORES="unknown"
+  fi
+  
+  echo "$CPU_CORES"
+}
+
+# Function to log messages based on verbosity
+log_verbose() {
+  if [[ "$verbose" == true ]]; then
+    echo "[VERBOSE] $*"
+  fi
+}
+
+# Function to get file size in bytes
+get_file_size_bytes() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "0"
+  fi
+}
+
+# Function to get human-readable file size
+get_file_size() {
+  local file="$1"
+  local bytes
+  bytes=$(get_file_size_bytes "$file")
+  
+  if [[ "$bytes" -eq 0 ]]; then
+    echo "0 bytes"
+  elif [[ "$bytes" -lt 1024 ]]; then
+    echo "${bytes} bytes"
+  elif [[ "$bytes" -lt 1048576 ]]; then
+    echo "$(( bytes / 1024 )) KB"
+  elif [[ "$bytes" -lt 1073741824 ]]; then
+    echo "$(( bytes / 1048576 )) MB"
+  else
+    echo "$(( bytes / 1073741824 )) GB"
+  fi
+}
+
+# Function to check if directory is empty
+is_directory_empty() {
+  local dir="$1"
+  [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]
+}
+
+# Function to get directory size in bytes
+get_directory_size() {
+  local dir="$1"
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    du -sk "$dir" 2>/dev/null | cut -f1 | awk '{print $1 * 1024}'
+  else
+    du -sb "$dir" 2>/dev/null | cut -f1
+  fi
+}
+
+# Function to get available disk space in bytes
+get_available_space() {
+  local path="$1"
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    df -k "$path" 2>/dev/null | tail -1 | awk '{print $4 * 1024}'
+  else
+    df -B1 "$path" 2>/dev/null | tail -1 | awk '{print $4}'
+  fi
+}
+
+# Helper function to format bytes (for disk space check)
+get_file_size_from_bytes() {
+  local bytes="$1"
+  if [[ "$bytes" -lt 1024 ]]; then
+    echo "${bytes} bytes"
+  elif [[ "$bytes" -lt 1048576 ]]; then
+    echo "$(( bytes / 1024 )) KB"
+  elif [[ "$bytes" -lt 1073741824 ]]; then
+    echo "$(( bytes / 1048576 )) MB"
+  else
+    echo "$(( bytes / 1073741824 )) GB"
+  fi
+}
+
+# Function to check if there's enough disk space
+check_disk_space() {
+  local src_dir="$1"
+  local out_dir="$2"
+  
+  local src_size available_space
+  src_size=$(get_directory_size "$src_dir")
+  available_space=$(get_available_space "$out_dir")
+  
+  if [[ -z "$src_size" ]] || [[ "$src_size" -eq 0 ]]; then
+    log_verbose "Warning: Unable to determine source directory size"
+    return 0
+  fi
+  
+  if [[ -z "$available_space" ]] || [[ "$available_space" -eq 0 ]]; then
+    log_verbose "Warning: Unable to determine available disk space"
+    return 0
+  fi
+  
+  # Estimate compressed size as 50% of original (conservative estimate)
+  local estimated_archive_size=$((src_size / 2))
+  
+  if [[ "$available_space" -lt "$estimated_archive_size" ]]; then
+    echo "Error: Insufficient disk space. Available: $(get_file_size_from_bytes "$available_space"), estimated need: $(get_file_size_from_bytes "$estimated_archive_size")"
+    return 1
+  fi
+  
+  log_verbose "Disk space check passed. Available: $(get_file_size_from_bytes "$available_space"), estimated need: $(get_file_size_from_bytes "$estimated_archive_size")"
+  return 0
+}
+
+# Check if 7z is installed
+check_7z_installed() {
+  if ! command -v 7z >/dev/null; then
+    echo "Error: 7z is not installed. Please install it and try again."
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      echo "For macOS, you can use Homebrew: brew install p7zip"
+    else
+      echo "For Ubuntu, you can use apt: sudo apt install p7zip-full"
+    fi
+    exit 1
+  fi
+}
+
+# ============================================================================
+# TRUENAS INTEGRATION FUNCTIONS
+# ============================================================================
+
+# Function to test SSH connection to a host
+test_ssh_connection() {
+  local host="$1"
+  local user="${TRUENAS_SSH_USER:-root}"
+  
+  log_verbose "Testing SSH connection to $host"
+  ssh -o ConnectTimeout=3 -o LogLevel=ERROR "$user@$host" "echo 'test'" >/dev/null 2>&1
+}
+
+# Function to find working TrueNAS host
+find_working_host() {
+  local hosts=()
+  
+  # Build array of hosts to try in priority order
+  if [[ -n "$tailnet_name" ]]; then
+    # Specific tailnet requested
+    log_verbose "Using specific tailnet: $tailnet_name"
+    case "$tailnet_name" in
+      personal)
+        [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && hosts+=("$TRUENAS_HOST_TAILSCALE")
+        ;;
+      changelog)
+        [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && hosts+=("$TRUENAS_HOST_CHANGELOG")
+        ;;
+      *)
+        # Try to map generic name to variable (e.g., TRUENAS_HOST_MYORG)
+        local var_name="TRUENAS_HOST_$(echo "$tailnet_name" | tr '[:lower:]' '[:upper:]')"
+        local host_value="${!var_name:-}"
+        if [[ -n "$host_value" ]]; then
+          hosts+=("$host_value")
+        else
+          echo "Error: Unknown tailnet '$tailnet_name'. Available: personal, changelog"
+          echo "Or add $var_name to ~/.truenas-config"
+          return 1
+        fi
+        ;;
+    esac
+  elif [[ "$force_tailscale" == "true" ]]; then
+    # Force Tailscale: skip local, try all Tailscale hosts
+    log_verbose "Forcing Tailscale connection (--tailscale flag used)"
+    [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && hosts+=("$TRUENAS_HOST_TAILSCALE")
+    [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && hosts+=("$TRUENAS_HOST_CHANGELOG")
+  else
+    # Normal priority: local first, then Tailscale
+    [[ -n "${TRUENAS_HOST_LOCAL:-}" ]] && hosts+=("$TRUENAS_HOST_LOCAL")
+    [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && hosts+=("$TRUENAS_HOST_TAILSCALE")
+    [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && hosts+=("$TRUENAS_HOST_CHANGELOG")
+  fi
+  
+  # If legacy TRUENAS_HOST is set, use it as fallback
+  [[ -n "${TRUENAS_HOST:-}" ]] && hosts+=("$TRUENAS_HOST")
+  
+  for host in "${hosts[@]}"; do
+    if test_ssh_connection "$host"; then
+      log_verbose "Successfully connected to $host"
+      echo "$host"
+      return 0
+    else
+      log_verbose "Failed to connect to $host"
+    fi
+  done
+  
+  echo ""
+  return 1
+}
+
+# Function to load TrueNAS configuration
+load_truenas_config() {
+  local config_file="${HOME}/.truenas-config"
+  
+  # Set defaults
+  TRUENAS_HOST_LOCAL=""
+  TRUENAS_HOST_TAILSCALE=""
+  TRUENAS_HOST_CHANGELOG=""
+  TRUENAS_HOST=""
+  TRUENAS_API_KEY=""
+  TRUENAS_PROTOCOL="http"
+  
+  # Load from config file if exists
+  if [[ -f "$config_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$config_file"
+    log_verbose "Loaded TrueNAS config from $config_file"
+    
+    # Find working host
+    TRUENAS_HOST=$(find_working_host)
+    if [[ -z "$TRUENAS_HOST" ]]; then
+      echo "Error: Could not connect to any configured TrueNAS hosts"
+      echo "Tried:"
+      [[ -n "${TRUENAS_HOST_LOCAL:-}" ]] && echo "  Local: $TRUENAS_HOST_LOCAL"
+      [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && echo "  Tailscale: $TRUENAS_HOST_TAILSCALE"
+      [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && echo "  Changelog: $TRUENAS_HOST_CHANGELOG"
+      return 1
+    else
+      log_verbose "Using TrueNAS host: $TRUENAS_HOST"
+    fi
+  else
+    echo "Warning: No TrueNAS config found at $config_file"
+    echo "Please create config file with:"
+    echo "  TRUENAS_HOST_LOCAL=192.168.100.66"
+    echo "  TRUENAS_HOST_TAILSCALE=your-tailscale-host.ts.net"
+    echo "  TRUENAS_API_KEY=your-api-key-here"
+    echo "  TRUENAS_PROTOCOL=http"
+    echo "  TRUENAS_SSH_USER=your-username"
+    return 1
+  fi
+}
+
+# Function to test TrueNAS connection
+test_truenas_connection() {
+  if [[ -z "$TRUENAS_API_KEY" ]]; then
+    echo "Error: TRUENAS_API_KEY not set in ~/.truenas-config"
+    return 1
+  fi
+  
+  log_verbose "Testing TrueNAS connection to $TRUENAS_HOST"
+  
+  local response
+  response=$(curl -s -w "%{http_code}" \
+    -H "Authorization: Bearer $TRUENAS_API_KEY" \
+    "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/system/info" 2>/dev/null)
+  
+  local http_code="${response: -3}"
+  local body="${response%???}"
+  
+  if [[ "$http_code" == "200" ]]; then
+    log_verbose "TrueNAS connection successful"
+    return 0
+  else
+    echo "Error: TrueNAS connection failed (HTTP $http_code)"
+    echo "Check your API key and network connection"
+    return 1
+  fi
+}
+
+# Function to create directory on TrueNAS
+create_truenas_directory() {
+  local remote_dir="$1"
+  
+  log_verbose "Creating directory on TrueNAS: $remote_dir"
+  
+  # Check if directory exists first
+  local check_response
+  check_response=$(curl -s -w "%{http_code}" \
+    -H "Authorization: Bearer $TRUENAS_API_KEY" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    -d "{\"path\":\"$remote_dir\"}" \
+    "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/filesystem/stat" 2>/dev/null)
+  
+  local check_code="${check_response: -3}"
+  
+  if [[ "$check_code" == "200" ]]; then
+    log_verbose "Directory already exists: $remote_dir"
+    return 0
+  fi
+  
+  # Create directory using correct API (no mode parameter)
+  local response
+  response=$(curl -s -w "%{http_code}" \
+    -H "Authorization: Bearer $TRUENAS_API_KEY" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    -d "{\"path\":\"$remote_dir\"}" \
+    "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/filesystem/mkdir" 2>/dev/null)
+  
+  local http_code="${response: -3}"
+  
+  if [[ "$http_code" == "200" ]]; then
+    log_verbose "Directory created: $remote_dir"
+    return 0
+  else
+    log_verbose "Directory creation failed (HTTP $http_code), will try upload anyway"
+    return 0  # Don't fail - directory might exist or be created during upload
+  fi
+}
+
+# Function to upload file to TrueNAS
+upload_to_truenas() {
+  local local_file="$1"
+  local remote_path="$2"
+  
+  if [[ ! -f "$local_file" ]]; then
+    echo "Error: Local file not found: $local_file"
+    return 1
+  fi
+  
+  echo "Uploading to TrueNAS: $(basename "$local_file")"
+  log_verbose "Upload: $local_file -> $remote_path"
+  
+  # Create remote directory if needed
+  local remote_dir
+  remote_dir=$(dirname "$remote_path")
+  create_truenas_directory "$remote_dir"
+  
+  # For large files like archives, use rsync instead of API
+  # Check if we can use rsync (requires SSH access to TrueNAS)
+  if command -v rsync >/dev/null 2>&1 && [[ -n "${TRUENAS_SSH_USER:-}" ]]; then
+    log_verbose "Using rsync for large file upload"
+    
+    # Create remote directory first via SSH
+    ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+        "mkdir -p '$(dirname "$remote_path")'" >/dev/null 2>&1
+    
+    # Skip smart checking if --force is used
+    if [[ "$force_upload" != "true" ]]; then
+      # Check if remote file exists and compare
+      local remote_stat
+      remote_stat=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+          "stat -c '%s %Y' '$remote_path' 2>/dev/null" 2>/dev/null)
+      
+      if [[ -n "$remote_stat" ]]; then
+        local remote_size remote_time local_size local_time
+        read -r remote_size remote_time <<< "$remote_stat"
+        local_size=$(stat -c%s "$local_file" 2>/dev/null || stat -f%z "$local_file" 2>/dev/null)
+        local_time=$(stat -c%Y "$local_file" 2>/dev/null || stat -f%m "$local_file" 2>/dev/null)
+        
+        if [[ "$remote_size" == "$local_size" ]]; then
+          if [[ "$remote_time" -gt "$local_time" ]]; then
+            # Remote file is newer - ask for confirmation
+            echo "Remote file exists and is newer than local file."
+            echo "Local:  $(date -d "@$local_time" 2>/dev/null || date -r "$local_time" 2>/dev/null)"
+            echo "Remote: $(date -d "@$remote_time" 2>/dev/null || date -r "$remote_time" 2>/dev/null)"
+            echo -n "Overwrite newer remote file? [y/N]: "
+            read -r response
+            if [[ ! "$response" =~ ^[Yy]$ ]]; then
+              echo "Upload skipped - remote file is newer"
+              echo "✓ No changes needed"
+              exit 0
+            fi
+          else
+            # Same size, local is newer or same - skip
+            echo "✓ File already exists with same size - skipping upload"
+            echo "✓ No changes needed"
+            exit 0
+          fi
+        fi
+        # Different sizes - continue with upload
+      fi
+    else
+      log_verbose "Force upload enabled - skipping file comparison checks"
+    fi
+    
+    # Use rsync with optimized options for archive files
+    if rsync --archive --verbose --human-readable --progress \
+       "$local_file" "${TRUENAS_SSH_USER}@${TRUENAS_HOST}:${remote_path}" 2>/dev/null; then
+      echo "✓ Upload successful via rsync: $remote_path"
+      return 0
+    else
+      echo "✗ rsync upload failed, trying SCP fallback..."
+      
+      # SCP fallback
+      if command -v scp >/dev/null 2>&1; then
+        if scp "$local_file" "${TRUENAS_SSH_USER}@${TRUENAS_HOST}:${remote_path}" >/dev/null 2>&1; then
+          echo "✓ Upload successful via SCP: $remote_path"
+          return 0
+        else
+          echo "✗ SCP upload also failed, trying API method..."
+        fi
+      fi
+    fi
+  fi
+  
+  # Fallback to API method for smaller files
+  log_verbose "Attempting API upload (may fail for large files)"
+  
+  # Use multipart upload for the API
+  local response
+  response=$(curl -s -w "%{http_code}" \
+    -H "Authorization: Bearer $TRUENAS_API_KEY" \
+    -X POST \
+    -F "file=@$local_file" \
+    -F "path=$remote_path" \
+    "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/filesystem/put" 2>/dev/null)
+  
+  local http_code="${response: -3}"
+  local body="${response%???}"
+  
+  if [[ "$http_code" == "200" ]]; then
+    echo "✓ Upload successful: $remote_path"
+    return 0
+  else
+    echo "✗ Upload failed (HTTP $http_code)"
+    log_verbose "Response: $body"
+    echo ""
+    echo "TIP: For large files (>50MB), consider setting up SSH access to TrueNAS:"
+    echo "  1. Enable SSH service in TrueNAS: System → Services → SSH"
+    echo "  2. Add TRUENAS_SSH_USER=root to ~/.truenas-config"
+    echo "  3. Set up SSH key authentication"
+    return 1
+  fi
+}
+
+# Function to verify file on TrueNAS
+verify_truenas_file() {
+  local remote_path="$1"
+  local expected_size="$2"
+  
+  log_verbose "Verifying file on TrueNAS: $remote_path"
+  
+  # If SSH is available, use SSH for verification (more reliable)
+  if [[ -n "${TRUENAS_SSH_USER:-}" ]] && command -v ssh >/dev/null 2>&1; then
+    log_verbose "Using SSH for file verification"
+    
+    local remote_size
+    remote_size=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+      "stat -c%s '$remote_path' 2>/dev/null" 2>/dev/null)
+    
+    if [[ -n "$remote_size" ]] && [[ "$remote_size" =~ ^[0-9]+$ ]]; then
+      if [[ "$remote_size" == "$expected_size" ]]; then
+        log_verbose "SSH file verification successful (size: $remote_size bytes)"
+        return 0
+      else
+        echo "✗ File size mismatch: expected $expected_size, got $remote_size"
+        return 1
+      fi
+    else
+      echo "✗ Could not verify file via SSH"
+      return 1
+    fi
+  fi
+  
+  # Fallback to API method
+  local response
+  response=$(curl -s -w "%{http_code}" \
+    -H "Authorization: Bearer $TRUENAS_API_KEY" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"path\":\"$remote_path\"}" \
+    "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/filesystem/stat" 2>/dev/null)
+  
+  local http_code="${response: -3}"
+  local body="${response%???}"
+  
+  if [[ "$http_code" == "200" ]]; then
+    # Extract size from JSON response (basic parsing)
+    local remote_size
+    remote_size=$(echo "$body" | grep -o '"size":[0-9]*' | cut -d':' -f2)
+    
+    if [[ "$remote_size" == "$expected_size" ]]; then
+      log_verbose "API file verification successful (size: $remote_size bytes)"
+      return 0
+    else
+      echo "✗ File size mismatch: expected $expected_size, got $remote_size"
+      return 1
+    fi
+  else
+    echo "✗ Could not verify file on TrueNAS (HTTP $http_code)"
+    return 1
+  fi
+}
+
+# Function to list archives on TrueNAS
+list_truenas_uploads() {
+  local search_path="${1:-$truenas_path}"
+  log_verbose "Listing archives on TrueNAS at $search_path"
+  
+  # Check if SSH access is available (most reliable method)
+  if [[ -n "${TRUENAS_SSH_USER:-}" ]] && command -v ssh >/dev/null 2>&1; then
+    log_verbose "Using SSH to list TrueNAS archives"
+    
+    # Note: Host connection already tested by find_working_host(), so we trust it
+    
+    # Check if the base directory exists
+    if ! ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+         "test -d '$search_path'" 2>/dev/null; then
+      echo "Base directory not found on TrueNAS: $search_path"
+      echo "Create the directory first or check your path"
+      return 1
+    fi
+    
+    echo "Archives on TrueNAS ($TRUENAS_HOST:$search_path)"
+    echo "=================================================="
+    
+    # Get file listing with sizes and dates
+    local file_list
+    file_list=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+      "find '$search_path' -type f \( -name '*.7z' -o -name '*.log' -o -name '*.checksums' \) -exec ls -lh {} \; 2>/dev/null | sort -k9")
+    
+    if [[ -z "$file_list" ]]; then
+      echo "No archives found in $search_path"
+      return 0
+    fi
+    
+    # Process and format the file listing
+    echo "$file_list" | while IFS= read -r line; do
+      if [[ -n "$line" ]]; then
+        # Parse ls -lh output: permissions links user group size month day time/year path
+        local perms links user group size month day time_or_year filepath filename dirname
+        read -r perms links user group size month day time_or_year filepath <<< "$line"
+        
+        # Get relative path from base search_path
+        local rel_path="${filepath#$search_path/}"
+        filename=$(basename "$filepath")
+        dirname=$(dirname "$rel_path")
+        
+        # Format the output nicely
+        if [[ "$dirname" == "." ]]; then
+          # File in root directory
+          printf "%-8s %s %2s %5s  %s\n" "$size" "$month" "$day" "$time_or_year" "$filename"
+        else
+          # File in subdirectory
+          printf "%-8s %s %2s %5s  %s/%s\n" "$size" "$month" "$day" "$time_or_year" "$dirname" "$filename"
+        fi
+      fi
+    done
+    
+    # Show summary
+    local archive_count
+    archive_count=$(echo "$file_list" | grep -c '\.7z$' 2>/dev/null || echo "0")
+    echo ""
+    echo "Total archives: $archive_count"
+    
+    # Show directory structure if there are subdirectories
+    local dir_list
+    dir_list=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+      "find '$search_path' -maxdepth 1 -type d ! -path '$search_path' -exec basename {} \; 2>/dev/null | sort")
+    
+    if [[ -n "$dir_list" ]]; then
+      echo ""
+      echo "Subdirectories:"
+      echo "$dir_list" | while IFS= read -r dir; do
+        if [[ -n "$dir" ]]; then
+          local dir_count
+          dir_count=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+            "find '$search_path/$dir' -name '*.7z' -type f 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
+          printf "  %-20s (%s archives)\n" "$dir" "$dir_count"
+        fi
+      done
+    fi
+    
+    return 0
+    
+  else
+    # Fallback to API method (less reliable for file listings)
+    echo "SSH not available, using API method (limited functionality)"
+    
+    if [[ -z "$TRUENAS_API_KEY" ]]; then
+      echo "Error: No SSH access and no API key configured"
+      echo "Set up SSH access or add TRUENAS_API_KEY to ~/.truenas-config"
+      return 1
+    fi
+    
+    # Use API to list directory contents
+    local response
+    response=$(curl -s -w "%{http_code}" \
+      -H "Authorization: Bearer $TRUENAS_API_KEY" \
+      -X POST \
+      -H "Content-Type: application/json" \
+      -d "{\"path\":\"$search_path\"}" \
+      "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/filesystem/listdir" 2>/dev/null)
+    
+    local http_code="${response: -3}"
+    local body="${response%???}"
+    
+    if [[ "$http_code" == "200" ]]; then
+      echo "Archives on TrueNAS (API listing - basic info only)"
+      echo "=================================================="
+      
+      # Basic parsing of JSON response (looking for .7z files)
+      echo "$body" | grep -o '"name":"[^"]*\.7z"' | cut -d'"' -f4 | sort
+      
+      local count
+      count=$(echo "$body" | grep -c '\.7z"' 2>/dev/null || echo "0")
+      echo ""
+      echo "Found $count .7z files"
+      
+    else
+      echo "✗ Failed to list TrueNAS directory via API (HTTP $http_code)"
+      echo "Consider setting up SSH access for better functionality"
+      return 1
+    fi
+  fi
+}
+
+# ============================================================================
+# MAIN FUNCTIONS
+# ============================================================================
+
+# Function to show help message
+show_help() {
+  local cpu_cores
+  cpu_cores=$(get_cpu_cores)
+  
+  echo "7zarch - A script to create 7z archives with optimized compression settings"
+  echo ""
+  if [[ "$cpu_cores" != "unknown" ]]; then
+    echo "System Info: $cpu_cores CPU cores detected"
+    echo ""
+  fi
+  echo "Usage:"
+  echo "  7zarch <directory>                              # Create archive in current directory"
+  echo "  7zarch <directory> -o <output_dir>              # Create archive in specified output directory"
+  echo "  7zarch --files-from <manifest.txt>              # Process multiple directories from manifest file"
+  echo "  7zarch --files-from <manifest.txt> -o <out_dir> # Process manifest with custom output directory"
+  echo "  7zarch -c <level> <directory>                   # Set compression level (0-9, default: 9)"
+  echo "  7zarch --dry-run <directory>                    # Show what would be done without creating archives"
+  echo "  7zarch --upload-truenas <archive.7z>            # Upload existing archive to TrueNAS"
+  echo "  7zarch -h|--help                               # Show this help message"
+  echo ""
+  echo "Options:"
+  echo "  -o, --output DIR       Output directory for archives"
+  echo "  -c, --compression N    Compression level (0-9, default: 9)"
+  echo "  -t, --threads N        Number of CPU threads to use (1-$cpu_cores, default: all $cpu_cores cores)"
+  echo "  --files-from FILE      Read list of directories from manifest file"
+  echo "  --dry-run             Show operations without executing them"
+  echo "  --verify              Test archive integrity after creation"
+  echo "  --comprehensive       Enable comprehensive verification (detailed checks)"
+  echo "  --log                 Create detailed metadata log file"
+  echo "  --checksums           Generate checksum files for verification"
+  echo "  --recovery N          Add recovery records (1-10% of archive size)"
+  echo "  --upload-truenas FILE Upload existing archive to TrueNAS"
+  echo "  --upload-path PATH    Subdirectory under base TrueNAS path (e.g. 'podcasts/2025')"
+  echo "  --list-uploads [PATH] Show all archives stored on TrueNAS (absolute or relative path)"
+  echo "  --force               Force upload, overwrite existing files without prompting"
+  echo "  --tailscale           Force use of Tailscale connection (skip local network)"
+  echo "  --tailnet NAME        Use specific tailnet (personal, changelog, etc.)"
+  echo "  --truenas-path PATH   Custom base path on TrueNAS (default: /mnt/tanker/chlg/changelog)"
+  echo "  --info FILE           Show information about existing archive"
+  echo "  --list FILE           List contents of archive (files inside)"
+  echo "  --test FILE           Test archive integrity only"
+  echo "  --verify-checksums FILE   Verify archive against stored checksums"
+  echo "  -h, --help            Show help message"
+  echo "  -v, --verbose         Enable verbose output"
+  echo ""
+  echo "Examples:"
+  echo "  7zarch /path/to/folder"
+  echo "  7zarch /path/to/folder --output /backup/archives"
+  echo "  7zarch --files-from directories.txt --compression 5 --threads 4"
+  echo "  7zarch --comprehensive --log --checksums /path/to/folder"
+  echo "  7zarch --upload-truenas /path/to/archive.7z"
+  echo "  7zarch --upload-truenas /path/to/archive.7z --upload-path podcasts/2025"
+  echo "  7zarch --upload-truenas /path/to/archive.7z --force"
+  echo "  7zarch --list-uploads"
+  echo "  7zarch --list-uploads friends/2025"
+  echo "  7zarch --list-uploads /mnt/tanker/chlg/changelog/friends"
+  echo "  7zarch --list-uploads --tailscale"
+  echo "  7zarch --list-uploads --tailnet personal"
+  echo "  7zarch --list-uploads --tailnet changelog"
+  echo "  7zarch --info /path/to/archive.7z"
+  echo "  7zarch --list changelog--test.7z"
+}
+
+# Function to handle termination signals
+trap_exit() {
+  local signal="$1"
+  echo -e "\nReceived ${signal} signal. Cleaning up and exiting..."
+  
+  # Clean up any temporary files if needed
+  # (Currently none, but placeholder for future enhancements)
+  
+  exit 1
+}
+
+# Set trap functions to handle termination signals
+trap 'trap_exit SIGINT' SIGINT
+trap 'trap_exit SIGTERM' SIGTERM
+
+
+# Function to test archive integrity with comprehensive checks
+test_archive() {
+  local archive_file="$1"
+  local quiet="$2"
+  local comprehensive="$3"
+  
+  if [[ ! -f "$archive_file" ]]; then
+    echo "Error: Archive file '$archive_file' not found"
+    return 1
+  fi
+  
+  if [[ "$quiet" != "true" ]]; then
+    echo "Testing archive integrity: $(basename "$archive_file")"
+  fi
+  
+  # Basic integrity test
+  local test_output
+  test_output=$(7z t "$archive_file" 2>&1)
+  local test_result=$?
+  
+  if [[ $test_result -eq 0 ]]; then
+    if [[ "$quiet" != "true" ]]; then
+      echo "✓ Basic archive integrity test passed"
+      
+      # Show detailed test results if comprehensive
+      if [[ "$comprehensive" == "true" ]]; then
+        local file_count error_count
+        file_count=$(echo "$test_output" | grep -c "Testing" 2>/dev/null)
+        file_count=${file_count:-0}
+        error_count=$(echo "$test_output" | grep -c "ERROR\|ERRORS" 2>/dev/null)  
+        error_count=${error_count:-0}
+        
+        echo "  - Files tested: $file_count"
+        echo "  - Errors found: $error_count"
+        
+        # Check for warnings
+        local warning_count
+        warning_count=$(echo "$test_output" | grep -c "WARNING" 2>/dev/null)
+        warning_count=${warning_count:-0}
+        if [[ "$warning_count" -gt 0 ]]; then
+          echo "  - Warnings: $warning_count"
+        fi
+      fi
+    fi
+    
+    # Enhanced verification for comprehensive mode
+    if [[ "$comprehensive" == "true" ]]; then
+      perform_enhanced_verification "$archive_file" "$quiet"
+      return $?
+    fi
+    
+    return 0
+  else
+    echo "✗ Archive integrity test failed"
+    if [[ "$quiet" != "true" ]]; then
+      echo "Test output:"
+      echo "$test_output"
+    fi
+    return 1
+  fi
+}
+
+# Function to perform enhanced verification
+perform_enhanced_verification() {
+  local archive_file="$1"
+  local quiet="$2"
+  
+  if [[ "$quiet" != "true" ]]; then
+    echo "Performing enhanced verification..."
+  fi
+  
+  # Verify archive header and structure
+  if ! verify_archive_structure "$archive_file" "$quiet"; then
+    return 1
+  fi
+  
+  # Test random file extraction
+  if ! test_random_file_extraction "$archive_file" "$quiet"; then
+    return 1
+  fi
+  
+  return 0
+}
+
+# Function to verify archive structure
+verify_archive_structure() {
+  local archive_file="$1"
+  local quiet="$2"
+  
+  # Get detailed archive information
+  local info_output
+  info_output=$(7z l -slt "$archive_file" 2>&1)
+  local info_result=$?
+  
+  if [[ $info_result -ne 0 ]]; then
+    if [[ "$quiet" != "true" ]]; then
+      echo "✗ Archive structure verification failed"
+    fi
+    return 1
+  fi
+  
+  # Check for corruption indicators
+  if echo "$info_output" | grep -q "ERROR\|CORRUPT\|DAMAGED"; then
+    if [[ "$quiet" != "true" ]]; then
+      echo "✗ Archive structure shows signs of corruption"
+    fi
+    return 1
+  fi
+  
+  if [[ "$quiet" != "true" ]]; then
+    echo "✓ Archive structure verification passed"
+  fi
+  
+  return 0
+}
+
+# Function to test random file extraction
+test_random_file_extraction() {
+  local archive_file="$1"
+  local quiet="$2"
+  
+  # Get list of files in archive
+  local file_list
+  file_list=$(7z l -ba "$archive_file" 2>/dev/null | grep -v "^--\|^Path\|^Date\|^Attr\|^Size\|^Packed\|^CRC\|^Method\|^Block\|^Everything is Ok" | head -20)
+  
+  if [[ -z "$file_list" ]]; then
+    if [[ "$quiet" != "true" ]]; then
+      echo "⚠ No files found for extraction test"
+    fi
+    return 0
+  fi
+  
+  # Create temporary directory for test extraction
+  local temp_dir
+  temp_dir=$(mktemp -d "/tmp/7z_verify_XXXXXX")
+  
+  if [[ ! -d "$temp_dir" ]]; then
+    if [[ "$quiet" != "true" ]]; then
+      echo "✗ Failed to create temporary directory for extraction test"
+    fi
+    return 1
+  fi
+  
+  # Test extract a few random files
+  local test_files=0
+  local success_count=0
+  
+  echo "$file_list" | head -5 | while read -r file_line; do
+    if [[ -n "$file_line" ]]; then
+      ((test_files++))
+      
+      # Extract single file to test directory
+      if 7z e "$archive_file" "$file_line" -o"$temp_dir" -y >/dev/null 2>&1; then
+        ((success_count++))
+      fi
+    fi
+  done
+  
+  # Clean up
+  rm -rf "$temp_dir" 2>/dev/null
+  
+  if [[ "$quiet" != "true" ]]; then
+    echo "✓ Random file extraction test completed"
+  fi
+  
+  return 0
+}
+
+# Function to create archive metadata log
+create_metadata_log() {
+  local archive_file="$1"
+  local src_dir="$2"
+  local start_time="$3"
+  local end_time="$4"
+  local log_file="${archive_file}.log"
+  
+  log_verbose "Creating metadata log: $log_file"
+  
+  # Create comprehensive metadata log
+  {
+    echo "# Archive Metadata Log"
+    echo "# Generated by create_7z script"
+    echo "# Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo ""
+    
+    echo "## Archive Information"
+    echo "Archive File: $(basename "$archive_file")"
+    echo "Archive Path: $archive_file"
+    echo "Source Directory: $src_dir"
+    echo "Creation Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo ""
+    
+    echo "## Compression Settings"
+    echo "Compression Level: $compression_level"
+    echo "Thread Count: ${thread_count:-auto ($(get_cpu_cores) cores)}"
+    echo "Dictionary Size: 32MB"
+    echo "Fast Bytes: 64"
+    echo "Solid Compression: enabled"
+    echo "Algorithm: LZMA2"
+    if [[ -n "$recovery_percent" ]]; then
+      echo "Recovery Records: ${recovery_percent}% of archive size"
+    else
+      echo "Recovery Records: none"
+    fi
+    echo ""
+    
+    echo "## System Information"
+    echo "OS Type: $OSTYPE"
+    echo "Hostname: $(hostname 2>/dev/null || echo 'unknown')"
+    echo "User: $(whoami 2>/dev/null || echo 'unknown')"
+    echo "7z Version: $(7z | head -2 | tail -1 2>/dev/null || echo 'unknown')"
+    echo ""
+    
+    echo "## Performance Statistics"
+    local duration=$((end_time - start_time))
+    echo "Compression Time: ${duration}s"
+    
+    # Get archive size information
+    if [[ -f "$archive_file" ]]; then
+      local archive_size
+      archive_size=$(get_file_size_bytes "$archive_file")
+      echo "Archive Size: $archive_size bytes ($(get_file_size "$archive_file"))"
+      
+      # Get source directory size
+      local source_size
+      source_size=$(get_directory_size "$src_dir")
+      if [[ -n "$source_size" && "$source_size" -gt 0 ]]; then
+        echo "Source Size: $source_size bytes ($(get_file_size_from_bytes "$source_size"))"
+        local ratio=$((100 - (archive_size * 100 / source_size)))
+        echo "Compression Ratio: ${ratio}% reduction"
+      fi
+    fi
+    echo ""
+    
+    echo "## File Statistics"
+    if 7z l -slt "$archive_file" >/dev/null 2>&1; then
+      local info
+      info=$(7z l -slt "$archive_file" 2>/dev/null)
+      
+      local file_count
+      file_count=$(echo "$info" | grep -c "^Path = " || echo "0")
+      echo "Total Files: $file_count"
+      
+      # Get compression method
+      local method
+      method=$(echo "$info" | grep "^Method = " | head -1 | cut -d' ' -f3- || echo "Unknown")
+      if [[ -n "$method" && "$method" != "Unknown" ]]; then
+        echo "Compression Method: $method"
+      fi
+    fi
+    echo ""
+    
+    echo "## Verification Status"
+    echo "Basic Verification: $(test_archive "$archive_file" "true" && echo "PASSED" || echo "FAILED")"
+    if [[ "$comprehensive_verify" == "true" ]]; then
+      echo "Comprehensive Verification: $(test_archive "$archive_file" "true" "true" && echo "PASSED" || echo "FAILED")"
+    fi
+    echo ""
+    
+    echo "## Archive Listing (first 50 files)"
+    7z l "$archive_file" 2>/dev/null | head -70 | tail -50 || echo "Unable to list archive contents"
+    
+  } > "$log_file"
+  
+  if [[ -f "$log_file" ]]; then
+    echo "✓ Metadata log created: $log_file"
+  else
+    echo "✗ Failed to create metadata log"
+  fi
+}
+
+# Function to generate and store checksums
+generate_checksums() {
+  local archive_file="$1"
+  local src_dir="$2"
+  local checksum_file="${archive_file}.checksums"
+  
+  log_verbose "Generating checksums: $checksum_file"
+  
+  # Create checksums file
+  {
+    echo "# Checksums for archive verification"
+    echo "# Generated by create_7z script"
+    echo "# Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo ""
+    
+    echo "## Archive Checksums"
+    if command -v sha256sum >/dev/null 2>&1; then
+      echo "SHA256: $(sha256sum "$archive_file" | cut -d' ' -f1)"
+    elif command -v shasum >/dev/null 2>&1; then
+      echo "SHA256: $(shasum -a 256 "$archive_file" | cut -d' ' -f1)"
+    else
+      echo "SHA256: [sha256sum/shasum not available]"
+    fi
+    
+    if command -v md5sum >/dev/null 2>&1; then
+      echo "MD5: $(md5sum "$archive_file" | cut -d' ' -f1)"
+    elif command -v md5 >/dev/null 2>&1; then
+      echo "MD5: $(md5 -q "$archive_file")"
+    else
+      echo "MD5: [md5sum/md5 not available]"
+    fi
+    
+    # Get archive size for additional verification
+    local archive_size
+    archive_size=$(get_file_size_bytes "$archive_file")
+    echo "Size: $archive_size bytes"
+    
+    # CRC32 from 7z if available
+    if 7z h "$archive_file" >/dev/null 2>&1; then
+      local crc32
+      crc32=$(7z h "$archive_file" 2>/dev/null | grep "CRC32" | cut -d':' -f2 | tr -d ' ' || echo "[not available]")
+      if [[ -n "$crc32" && "$crc32" != "[not available]" ]]; then
+        echo "CRC32: $crc32"
+      fi
+    fi
+    
+    echo ""
+    echo "## Source Directory Information"
+    echo "Source Path: $src_dir"
+    
+    # Generate source directory checksum if possible (for small directories)
+    local source_size
+    source_size=$(get_directory_size "$src_dir")
+    if [[ -n "$source_size" ]]; then
+      echo "Source Size: $source_size bytes"
+      
+      # For reproducibility, create a file list with checksums (excluding same files as archive)
+      echo ""
+      echo "## Source File Manifest (first 100 files, excluding .DS_Store, __MACOSX, *.pkf)"
+      if command -v find >/dev/null 2>&1; then
+        find "$src_dir" -type f ! -name ".DS_Store" ! -path "*/__MACOSX/*" ! -name "*.pkf" | head -100 | sort | while read -r file; do
+          if [[ -f "$file" ]]; then
+            local file_size
+            file_size=$(get_file_size_bytes "$file")
+            local rel_path
+            rel_path="${file#$src_dir/}"
+            echo "$file_size  $rel_path"
+          fi
+        done 2>/dev/null || echo "Unable to generate file manifest"
+      fi
+    fi
+    
+  } > "$checksum_file"
+  
+  if [[ -f "$checksum_file" ]]; then
+    echo "✓ Checksums generated: $checksum_file"
+  else
+    echo "✗ Failed to generate checksums"
+  fi
+}
+
+# Function to verify checksums
+verify_checksums() {
+  local archive_file="$1"
+  local checksum_file="${archive_file}.checksums"
+  
+  if [[ ! -f "$checksum_file" ]]; then
+    echo "⚠ Checksum file not found: $checksum_file"
+    return 1
+  fi
+  
+  echo "Verifying checksums from: $(basename "$checksum_file")"
+  
+  # Verify SHA256 if available
+  local stored_sha256 current_sha256
+  stored_sha256=$(grep "^SHA256:" "$checksum_file" | cut -d' ' -f2)
+  if [[ -n "$stored_sha256" && "$stored_sha256" != "[sha256sum/shasum" ]]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      current_sha256=$(sha256sum "$archive_file" | cut -d' ' -f1)
+    elif command -v shasum >/dev/null 2>&1; then
+      current_sha256=$(shasum -a 256 "$archive_file" | cut -d' ' -f1)
+    fi
+    
+    if [[ -n "$current_sha256" ]]; then
+      if [[ "$stored_sha256" == "$current_sha256" ]]; then
+        echo "✓ SHA256 checksum verified"
+      else
+        echo "✗ SHA256 checksum mismatch!"
+        echo "  Expected: $stored_sha256"
+        echo "  Current:  $current_sha256"
+        return 1
+      fi
+    fi
+  fi
+  
+  # Verify file size
+  local stored_size current_size
+  stored_size=$(grep "^Size:" "$checksum_file" | cut -d' ' -f2)
+  if [[ -n "$stored_size" ]]; then
+    current_size=$(get_file_size_bytes "$archive_file")
+    if [[ "$stored_size" == "$current_size" ]]; then
+      echo "✓ File size verified ($current_size bytes)"
+    else
+      echo "✗ File size mismatch!"
+      echo "  Expected: $stored_size bytes"
+      echo "  Current:  $current_size bytes"
+      return 1
+    fi
+  fi
+  
+  echo "✓ Checksum verification completed"
+  return 0
+}
+
+# Function to list archive contents
+list_archive_contents() {
+  local archive_file="$1"
+  
+  if [[ ! -f "$archive_file" ]]; then
+    echo "Error: Archive file '$archive_file' not found"
+    return 1
+  fi
+  
+  echo "Contents of archive: $(basename "$archive_file")"
+  echo "==========================================="
+  
+  # Use 7z l command to list contents - this gives the same output as 7z normally would
+  7z l "$archive_file"
+}
+
+# Function to show archive information
+show_archive_info() {
+  local archive_file="$1"
+  
+  if [[ ! -f "$archive_file" ]]; then
+    echo "Error: Archive file '$archive_file' not found"
+    return 1
+  fi
+  
+  echo "Archive Information: $(basename "$archive_file")"
+  echo "==========================================="
+  
+  local file_size
+  file_size=$(get_file_size_bytes "$archive_file")
+  echo "File size: ${file_size} bytes"
+  
+  # Get detailed info from 7z
+  if 7z l -slt "$archive_file" >/dev/null 2>&1; then
+    local info
+    info=$(7z l -slt "$archive_file" 2>/dev/null)
+    
+    local file_count
+    file_count=$(echo "$info" | grep -c "^Path = " || echo "0")
+    echo "Files: $file_count"
+    
+    local method
+    method=$(echo "$info" | grep "^Method = " | head -1 | cut -d' ' -f3- || echo "Unknown")
+    if [[ -n "$method" && "$method" != "Unknown" ]]; then
+      echo "Compression: $method"
+    fi
+    
+    # Get size information from 7z
+    local packed_size unpacked_size
+    packed_size=$(echo "$info" | grep "^Packed Size = " | head -1 | cut -d' ' -f4 || echo "")
+    unpacked_size=$(echo "$info" | grep "^Size = " | head -1 | cut -d' ' -f3 || echo "")
+    
+    if [[ -n "$packed_size" && -n "$unpacked_size" && "$unpacked_size" -gt 0 ]]; then
+      echo "Original size: ${unpacked_size} bytes"
+      echo "Compressed size: ${packed_size} bytes"
+      # Simple ratio calculation using shell arithmetic
+      local ratio_percent
+      ratio_percent=$(( (unpacked_size - packed_size) * 100 / unpacked_size ))
+      echo "Compression ratio: ${ratio_percent}% reduction"
+    fi
+    
+    # Creation date
+    local create_date
+    create_date=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$archive_file" 2>/dev/null || stat -c "%y" "$archive_file" 2>/dev/null | cut -d'.' -f1 || echo "Unknown")
+    echo "Created: $create_date"
+  else
+    echo "Warning: Unable to read archive details"
+  fi
+  
+  echo "==========================================="
+  
+  # Test integrity
+  test_archive "$archive_file" "false"
+}
+
+# Function to validate archive creation preconditions
+validate_archive_preconditions() {
+  local src_dir="$1"
+  local archive_out="$2"
+  local out_dir="$3"
+
+  # Skip archive creation if the file already exists
+  if [[ -f "${archive_out}" ]]; then
+    echo "Notice: Skipping ${src_dir} as ${archive_out} already exists."
+    return 1
+  fi
+
+  # Check if source directory is empty
+  if is_directory_empty "${src_dir}"; then
+    echo "Error: Source directory ${src_dir} is empty. No files to compress."
+    return 1
+  fi
+
+  # Check available disk space
+  if ! check_disk_space "${src_dir}" "${out_dir}"; then
+    return 1
+  fi
+
+  return 0
+}
+
+# Function to show dry run information
+show_dry_run_info() {
+  local archive_out="$1"
+  local src_dir="$2"
+  local cpu_cores
+  
+  echo "[DRY RUN] Would create: ${archive_out}"
+  echo "[DRY RUN] Source: ${src_dir}"
+  echo "[DRY RUN] Compression level: ${compression_level}"
+  cpu_cores=$(get_cpu_cores)
+  echo "[DRY RUN] Thread count: ${thread_count:-all available ($cpu_cores cores)}"
+}
+
+# Function to determine thread parameters
+get_thread_parameters() {
+  local archive_name="$1"
+  local thread_param
+  
+  if [[ -n "$thread_count" ]]; then
+    thread_param="-mmt=${thread_count}"
+    echo "Creating 7z archive: ${archive_name}.7z (compression level: ${compression_level}, threads: ${thread_count})" >&2
+  else
+    thread_param="-mmt=on"
+    local cpu_cores
+    cpu_cores=$(get_cpu_cores)
+    echo "Creating 7z archive: ${archive_name}.7z (compression level: ${compression_level}, threads: all available ($cpu_cores cores))" >&2
+  fi
+  
+  echo "$thread_param"
+}
+
+# Function to execute 7z compression
+execute_compression() {
+  local archive_out="$1"
+  local src_dir="$2"
+  local thread_param="$3"
+  
+  # Note: 7z does not support recovery records (that's a RAR feature)
+  if [[ -n "$recovery_percent" ]]; then
+    echo "Warning: 7z format does not support recovery records. Use RAR format for recovery record support."
+    log_verbose "Recovery records not supported in 7z format"
+  fi
+  
+  if [[ "$verbose" == true ]]; then
+    7z a -t7z -m0=lzma2 -mx="${compression_level}" -mfb=64 -md=32m -ms=on "${thread_param}" "${archive_out}" "${src_dir}" -xr!"__MACOSX" -xr!".DS_Store" -xr!"*.pkf"
+  else
+    7z a -t7z -m0=lzma2 -mx="${compression_level}" -mfb=64 -md=32m -ms=on "${thread_param}" "${archive_out}" "${src_dir}" -xr!"__MACOSX" -xr!".DS_Store" -xr!"*.pkf" >/dev/null
+  fi
+}
+
+# Function to handle post-compression tasks
+handle_compression_result() {
+  local exit_code="$1"
+  local archive_out="$2"
+  local duration="$3"
+  
+  if [[ $exit_code -eq 0 ]]; then
+    local compressed_size
+    compressed_size=$(get_file_size_bytes "${archive_out}")
+    echo "Success: Created ${archive_out} (${compressed_size} bytes) in ${duration}s"
+    
+    log_verbose "Archive creation completed successfully"
+    
+    # Verify archive if requested
+    if [[ "$verify_after" == true ]]; then
+      echo "Verifying archive integrity..."
+      test_archive "${archive_out}" "false" "$comprehensive_verify"
+    fi
+    
+    # Create metadata log if requested
+    if [[ "$create_log" == true ]]; then
+      create_metadata_log "${archive_out}" "${src_dir}" "$start_time" "$end_time"
+    fi
+    
+    # Generate checksums if requested
+    if [[ "$generate_checksums_flag" == true ]]; then
+      generate_checksums "${archive_out}" "${src_dir}"
+    fi
+    
+    
+    return 0
+  else
+    echo "Error: Failed to create archive ${archive_out} (exit code: ${exit_code})"
+    return $exit_code
+  fi
+}
+
+# Function to create a 7z archive with multi-threaded compression
+create_archive() {
+  local src_dir="$1"
+  local base_out_dir="$2"
+  local archive_name archive_out out_dir start_time end_time duration thread_param
+
+  src_dir="${src_dir%/}"
+  archive_name="${src_dir##*/}"
+  archive_name="${archive_name%.*}"
+  out_dir="${base_out_dir:-$(pwd)}"
+  archive_out="${out_dir}/${archive_name}.7z"
+
+  # Validate preconditions
+  if ! validate_archive_preconditions "${src_dir}" "${archive_out}" "${out_dir}"; then
+    [[ -f "${archive_out}" ]] && return 0 || return 1
+  fi
+
+  # Handle dry run mode
+  if [[ "$dry_run" == true ]]; then
+    show_dry_run_info "${archive_out}" "${src_dir}"
+    return 0
+  fi
+
+  # Log verbose information
+  log_verbose "Starting compression of ${src_dir}"
+  log_verbose "Output file: ${archive_out}"
+  log_verbose "Compression level: ${compression_level}"
+  local cpu_cores
+  cpu_cores=$(get_cpu_cores)
+  log_verbose "Thread count: ${thread_count:-all available ($cpu_cores cores)}"
+
+  # Get thread parameters and show creation message
+  thread_param=$(get_thread_parameters "${archive_name}")
+  
+  # Execute compression
+  start_time=$(date +%s)
+  execute_compression "${archive_out}" "${src_dir}" "${thread_param}"
+  local exit_code=$?
+  end_time=$(date +%s)
+  duration=$((end_time - start_time))
+  
+  # Handle result
+  handle_compression_result $exit_code "${archive_out}" "${duration}"
+}
+
+# Function to process a manifest file
+process_manifest() {
+  local manifest_file="$1"
+  local out_dir="$2"
+  local dir line_num=0 processed=0 skipped=0 failed=0
+
+  echo "Processing manifest file: ${manifest_file}"
+  log_verbose "Reading directories from ${manifest_file}"
+
+  while IFS= read -r dir; do
+    ((line_num++))
+    
+    # Skip empty lines and comments
+    if [[ -z "$dir" ]] || [[ "$dir" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    
+    # Trim whitespace
+    dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    if [[ -d "${dir}" ]]; then
+      log_verbose "Processing line ${line_num}: ${dir}"
+      if create_archive "${dir}" "${out_dir}"; then
+        ((processed++))
+      else
+        ((failed++))
+        echo "Warning: Failed to process ${dir} from line ${line_num}"
+      fi
+    else
+      ((skipped++))
+      echo "Warning: Skipping non-directory at line ${line_num}: ${dir}"
+    fi
+  done < "${manifest_file}"
+  
+  echo "Manifest processing complete: ${processed} processed, ${skipped} skipped, ${failed} failed"
+}
+
+# Check if 7z is installed
+check_7z_installed
+
+# Initialize variables
+src=""
+out_dir=""
+manifest_mode=false
+compression_level=9
+thread_count=""
+dry_run=false
+verbose=false
+verify_after=false
+comprehensive_verify=false
+create_log=false
+generate_checksums_flag=false
+recovery_percent=""
+upload_truenas_mode=false
+upload_truenas_file=""
+upload_path=""
+force_upload=false
+force_tailscale=false
+tailnet_name=""
+list_uploads_mode=false
+list_uploads_path=""
+truenas_path="/mnt/tanker/chlg/changelog"
+info_mode=false
+list_mode=false
+test_mode=false
+verify_checksums_mode=false
+info_file=""
+list_file=""
+test_file=""
+verify_checksums_file=""
+
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    --files-from)
+      if [[ -z "$2" ]]; then
+        echo "Error: --files-from requires a file argument"
+        exit 1
+      fi
+      manifest_mode=true
+      src="$2"
+      shift 2
+      ;;
+    -o|--output)
+      if [[ -z "$2" ]]; then
+        echo "Error: -o/--output requires a directory argument"
+        exit 1
+      fi
+      out_dir="$2"
+      shift 2
+      ;;
+    -c|--compression)
+      if [[ -z "$2" ]] || ! [[ "$2" =~ ^[0-9]$ ]]; then
+        echo "Error: -c/--compression requires a number between 0-9"
+        exit 1
+      fi
+      compression_level="$2"
+      shift 2
+      ;;
+    -t|--threads)
+      if [[ -z "$2" ]] || ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -eq 0 ]]; then
+        echo "Error: -t/--threads requires a positive integer"
+        exit 1
+      fi
+      thread_count="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --verify)
+      verify_after=true
+      shift
+      ;;
+    --comprehensive)
+      comprehensive_verify=true
+      verify_after=true  # Enable verification if comprehensive is requested
+      shift
+      ;;
+    --log)
+      create_log=true
+      shift
+      ;;
+    --checksums)
+      generate_checksums_flag=true
+      shift
+      ;;
+    --recovery)
+      if [[ -z "$2" ]] || ! [[ "$2" =~ ^[1-9]$|^10$ ]]; then
+        echo "Error: --recovery requires a number between 1-10 (percent)"
+        exit 1
+      fi
+      recovery_percent="$2"
+      shift 2
+      ;;
+    --upload-truenas)
+      if [[ -z "$2" ]]; then
+        echo "Error: --upload-truenas requires an archive file argument"
+        exit 1
+      fi
+      upload_truenas_mode=true
+      upload_truenas_file="$2"
+      shift 2
+      ;;
+    --upload-path)
+      if [[ -z "$2" ]]; then
+        echo "Error: --upload-path requires a path argument"
+        exit 1
+      fi
+      upload_path="$2"
+      shift 2
+      ;;
+    --force)
+      force_upload=true
+      shift
+      ;;
+    --tailscale)
+      force_tailscale=true
+      shift
+      ;;
+    --tailnet)
+      if [[ -z "$2" ]]; then
+        echo "Error: --tailnet requires a tailnet name (personal, changelog, etc.)"
+        exit 1
+      fi
+      tailnet_name="$2"
+      force_tailscale=true  # Implies tailscale usage
+      shift 2
+      ;;
+    --truenas-path)
+      if [[ -z "$2" ]]; then
+        echo "Error: --truenas-path requires a path argument"
+        exit 1
+      fi
+      truenas_path="$2"
+      shift 2
+      ;;
+    --info)
+      if [[ -z "$2" ]]; then
+        echo "Error: --info requires an archive file argument"
+        exit 1
+      fi
+      info_mode=true
+      info_file="$2"
+      shift 2
+      ;;
+    --list)
+      if [[ -z "$2" ]]; then
+        echo "Error: --list requires an archive file argument"
+        exit 1
+      fi
+      list_mode=true
+      list_file="$2"
+      shift 2
+      ;;
+    --test)
+      if [[ -z "$2" ]]; then
+        echo "Error: --test requires an archive file argument"
+        exit 1
+      fi
+      test_mode=true
+      test_file="$2"
+      shift 2
+      ;;
+    --verify-checksums)
+      if [[ -z "$2" ]]; then
+        echo "Error: --verify-checksums requires an archive file argument"
+        exit 1
+      fi
+      verify_checksums_mode=true
+      verify_checksums_file="$2"
+      shift 2
+      ;;
+    --list-uploads)
+      list_uploads_mode=true
+      # Check if next argument is a path (doesn't start with --)
+      if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+        list_uploads_path="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    -v|--verbose)
+      verbose=true
+      shift
+      ;;
+    -*)
+      echo "Error: Unknown option $1"
+      show_help
+      exit 1
+      ;;
+    *)
+      if [[ -z "$src" ]]; then
+        src="$1"
+      else
+        echo "Error: Multiple source arguments provided"
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Handle special modes first
+if [[ "$info_mode" == true ]]; then
+  show_archive_info "$info_file"
+  exit $?
+elif [[ "$list_mode" == true ]]; then
+  list_archive_contents "$list_file"
+  exit $?
+elif [[ "$test_mode" == true ]]; then
+  test_archive "$test_file" "false"
+  exit $?
+elif [[ "$verify_checksums_mode" == true ]]; then
+  verify_checksums "$verify_checksums_file"
+  exit $?
+elif [[ "$list_uploads_mode" == true ]]; then
+  load_truenas_config
+  # Use custom path if provided, otherwise use default truenas_path
+  search_path=""
+  if [[ -n "$list_uploads_path" ]]; then
+    # If path starts with /, use as absolute path
+    # Otherwise, treat as relative to base truenas_path
+    if [[ "$list_uploads_path" =~ ^/ ]]; then
+      search_path="$list_uploads_path"
+    else
+      search_path="$truenas_path/$list_uploads_path"
+    fi
+  else
+    search_path="$truenas_path"
+  fi
+  list_truenas_uploads "$search_path"
+  exit $?
+elif [[ "$upload_truenas_mode" == true ]]; then
+  # Handle TrueNAS upload
+  if [[ ! -f "$upload_truenas_file" ]]; then
+    echo "Error: Archive file not found: $upload_truenas_file"
+    exit 1
+  fi
+  
+  load_truenas_config
+  
+  if test_truenas_connection; then
+    archive_filename=$(basename "$upload_truenas_file")
+    
+    # Build remote path with optional subdirectory
+    if [[ -n "$upload_path" ]]; then
+      remote_path="${truenas_path}/${upload_path}/${archive_filename}"
+    else
+      remote_path="${truenas_path}/${archive_filename}"
+    fi
+    
+    file_size=$(get_file_size_bytes "$upload_truenas_file")
+    
+    if upload_to_truenas "$upload_truenas_file" "$remote_path"; then
+      # Verify the upload
+      if verify_truenas_file "$remote_path" "$file_size"; then
+        echo "✓ TrueNAS upload verified: $remote_path"
+        
+        # Also upload metadata files if they exist
+        base_path="${upload_truenas_file%.*}"
+        if [[ -f "${base_path}.log" ]]; then
+          echo "Uploading metadata: $(basename "${base_path}.log")"
+          upload_to_truenas "${base_path}.log" "${remote_path%.*}.log"
+        fi
+        if [[ -f "${base_path}.checksums" ]]; then
+          echo "Uploading metadata: $(basename "${base_path}.checksums")"
+          upload_to_truenas "${base_path}.checksums" "${remote_path%.*}.checksums"
+        fi
+        
+        echo "✓ Upload complete!"
+        exit 0
+      else
+        echo "✗ TrueNAS upload verification failed"
+        exit 1
+      fi
+    else
+      echo "✗ TrueNAS upload failed"
+      exit 1
+    fi
+  else
+    echo "✗ Cannot connect to TrueNAS"
+    exit 1
+  fi
+fi
+
+# Validate arguments for normal operation
+if [[ -z "$src" ]]; then
+  echo "Error: No source directory or manifest file specified"
+  show_help
+  exit 1
+fi
+
+# Check and set the output directory
+if [[ -n "${out_dir}" ]]; then
+  if [[ ! -d "${out_dir}" ]]; then
+    echo "Error: Output directory '${out_dir}' does not exist or is not a directory"
+    exit 1
+  fi
+  if [[ ! -w "${out_dir}" ]]; then
+    echo "Error: Output directory '${out_dir}' is not writable"
+    exit 1
+  fi
+fi
+
+# Call the appropriate function based on the input
+if [[ "${manifest_mode}" = true ]]; then
+  if [[ ! -f "${src}" ]]; then
+    echo "Error: Manifest file '${src}' does not exist or is not a file"
+    exit 1
+  fi
+  if [[ ! -r "${src}" ]]; then
+    echo "Error: Manifest file '${src}' is not readable"
+    exit 1
+  fi
+  process_manifest "${src}" "${out_dir}"
+elif [[ -d "${src}" ]]; then
+  if [[ ! -r "${src}" ]]; then
+    echo "Error: Source directory '${src}' is not readable"
+    exit 1
+  fi
+  create_archive "${src}" "${out_dir}"
+else
+  echo "Error: '${src}' is not a valid directory or use --files-from with a manifest file"
+  exit 1
+fi

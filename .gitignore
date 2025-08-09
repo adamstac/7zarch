@@ -1,0 +1,42 @@
+# Configuration files (use .example versions instead)
+.truenas-config
+truenas-config
+*.config
+
+# Test artifacts
+test/tmp/
+test/fixtures/generated/
+*.7z
+*.log
+*.checksums
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+debug.log
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Build artifacts  
+dist/
+build/
+
+# Node modules (if we add any JS tooling later)
+node_modules/
+
+# Archive test files (can be large)
+test/fixtures/*.7z
+test/fixtures/large-*

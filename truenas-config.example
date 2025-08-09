@@ -1,0 +1,20 @@
+# TrueNAS Scale Configuration for 7zarch script
+# Generated on 2025-08-07
+
+# Connection priority (tries in order until one works)
+TRUENAS_HOST_LOCAL=192.168.100.66
+TRUENAS_HOST_TAILSCALE=truenas-homelab.alai-in.ts.net  # Personal tailnet
+TRUENAS_HOST_CHANGELOG=truenas-changelog  # Changelog org tailnet
+
+TRUENAS_API_KEY=1-evPnT6PQ5bd2AHbEsHNGMLRtXIZzKtBf1LZSG03FF7LSzCMVXpuDUk02Fw2gEHW2
+TRUENAS_PROTOCOL=http
+
+# SSH configuration
+TRUENAS_SSH_USER=adamstacoviak
+
+# Tailscale setup instructions:
+# 1. Install Tailscale app in TrueNAS Scale
+# 2. Get auth key from https://login.tailscale.com/admin/settings/keys
+# 3. Set hostname (e.g., truenas-personal, truenas-changelog)
+# 4. Once connected, replace TRUENAS_HOST above with your .ts.net hostname
+# 5. Test: ssh adamstacoviak@truenas-personal.ts.net

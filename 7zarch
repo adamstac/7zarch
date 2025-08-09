@@ -689,6 +689,7 @@ show_help() {
   echo "Usage:"
   echo "  7zarch <directory>                              # Create archive in current directory"
   echo "  7zarch <directory> -o <output_dir>              # Create archive in specified output directory"
+  echo "  7zarch <dir1> <dir2> <dir3>                     # Process multiple directories"
   echo "  7zarch --files-from <manifest.txt>              # Process multiple directories from manifest file"
   echo "  7zarch --files-from <manifest.txt> -o <out_dir> # Process manifest with custom output directory"
   echo "  7zarch -c <level> <directory>                   # Set compression level (0-9, default: 9)"
@@ -724,6 +725,8 @@ show_help() {
   echo "Examples:"
   echo "  7zarch /path/to/folder"
   echo "  7zarch /path/to/folder --output /backup/archives"
+  echo "  7zarch dir1 dir2 dir3 --compression 5"
+  echo "  7zarch friends-* --output ~/archives/"  
   echo "  7zarch --files-from directories.txt --compression 5 --threads 4"
   echo "  7zarch --comprehensive --log --checksums /path/to/folder"
   echo "  7zarch --upload-truenas /path/to/archive.7z"
@@ -1446,13 +1449,52 @@ process_manifest() {
   echo "Manifest processing complete: ${processed} processed, ${skipped} skipped, ${failed} failed"
 }
 
+# Function to process multiple directories
+process_multiple_directories() {
+  local out_dir="$1"
+  shift
+  local directories=("$@")
+  local processed=0 skipped=0 failed=0
+
+  echo "Processing ${#directories[@]} directories..."
+  echo ""
+
+  for dir in "${directories[@]}"; do
+    log_verbose "Processing directory: ${dir}"
+    
+    if [[ -d "$dir" ]]; then
+      echo "Processing directory: ${dir}"
+      if create_archive "$dir" "$out_dir"; then
+        ((processed++))
+        echo "✓ Successfully processed: ${dir}"
+      else
+        ((failed++))
+        echo "✗ Failed to process: ${dir}"
+      fi
+    else
+      ((skipped++))
+      echo "⚠ Warning: Directory not found or not accessible: ${dir}"
+    fi
+    echo ""  # Add spacing between directories
+  done
+
+  echo "================================="
+  echo "Multiple directory processing complete:"
+  echo "  Processed: ${processed}"
+  echo "  Skipped:   ${skipped}"
+  echo "  Failed:    ${failed}"
+  echo "  Total:     $((processed + skipped + failed))"
+}
+
 # Check if 7z is installed
 check_7z_installed
 
 # Initialize variables
 src=""
+src_dirs=()  # Array for multiple directories
 out_dir=""
 manifest_mode=false
+multi_dir_mode=false
 compression_level=9
 thread_count=""
 dry_run=false
@@ -1651,11 +1693,14 @@ while [[ "$#" -gt 0 ]]; do
       exit 1
       ;;
     *)
+      # Collect all remaining arguments as source directories
       if [[ -z "$src" ]]; then
         src="$1"
       else
-        echo "Error: Multiple source arguments provided"
-        exit 1
+        # We have multiple directories
+        multi_dir_mode=true
+        src_dirs=("$src" "$@")
+        break
       fi
       shift
       ;;
@@ -1784,6 +1829,9 @@ if [[ "${manifest_mode}" = true ]]; then
     exit 1
   fi
   process_manifest "${src}" "${out_dir}"
+elif [[ "${multi_dir_mode}" = true ]]; then
+  # Process multiple directories
+  process_multiple_directories "${out_dir}" "${src_dirs[@]}"
 elif [[ -d "${src}" ]]; then
   if [[ ! -r "${src}" ]]; then
     echo "Error: Source directory '${src}' is not readable"

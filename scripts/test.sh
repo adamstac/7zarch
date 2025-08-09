@@ -179,6 +179,29 @@ EOF
 
 run_test "manifest processing" "$PROJECT_ROOT/7zarch --dry-run --files-from '$manifest_file' -o '$TMP_DIR'"
 
+# Test multiple directory processing
+echo ""
+echo "📂 Testing multiple directory processing..."
+
+# Create multi-directory test fixture if it doesn't exist
+multi_test_dir="$TEST_DIR/fixtures/multi-dir-test"
+if [[ ! -d "$multi_test_dir" ]]; then
+    mkdir -p "$multi_test_dir"/{friends-101--abi-noda,friends-102--ultrathink,friends-103--define-astronomer}
+    echo "test content 1" > "$multi_test_dir/friends-101--abi-noda/file1.txt"
+    echo "test content 2" > "$multi_test_dir/friends-102--ultrathink/file2.txt"
+    echo "test content 3" > "$multi_test_dir/friends-103--define-astronomer/file3.txt"
+fi
+
+# Test multiple directories as arguments
+cd "$multi_test_dir"
+run_test "multiple directories as arguments" "$PROJECT_ROOT/7zarch --dry-run friends-101--abi-noda friends-102--ultrathink friends-103--define-astronomer -o '$TMP_DIR'"
+
+# Test with glob expansion (if supported by shell)
+run_test "multiple directories with glob pattern" "$PROJECT_ROOT/7zarch --dry-run friends-* -o '$TMP_DIR'"
+
+# Return to original directory
+cd "$PROJECT_ROOT"
+
 # Test metadata options
 echo ""
 echo "📄 Testing metadata options..."

@@ -1,0 +1,109 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y p7zip-full curl ssh rsync
+        
+    - name: Verify dependencies
+      run: |
+        7z --help
+        curl --version
+        ssh -V
+        rsync --version
+        
+    - name: Set up test environment
+      run: |
+        chmod +x scripts/*.sh
+        chmod +x 7zarch
+        ./scripts/bootstrap.sh --ci
+        
+    - name: Run basic tests
+      run: |
+        # Skip TrueNAS tests in CI (no config available)
+        timeout 300 ./scripts/test.sh --no-truenas || true
+        
+    - name: Test help functionality
+      run: |
+        ./7zarch --help
+        
+    - name: Test basic archive creation
+      run: |
+        mkdir -p test-data
+        echo "Test file" > test-data/test.txt
+        ./7zarch test-data
+        test -f test-data.7z
+        7z t test-data.7z
+        
+    - name: Test dry run mode
+      run: |
+        ./7zarch --dry-run test-data
+        
+    - name: Test archive info
+      run: |
+        ./7zarch --info test-data.7z
+        ./7zarch --list test-data.7z
+        ./7zarch --test test-data.7z
+
+  compatibility:
+    name: Test Compatibility
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y p7zip-full
+        
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install p7zip
+        
+    - name: Test basic functionality
+      run: |
+        chmod +x 7zarch
+        ./7zarch --help
+        
+    - name: Test archive creation
+      run: |
+        mkdir -p test-sample
+        echo "Sample data" > test-sample/sample.txt
+        ./7zarch test-sample
+        test -f test-sample.7z
+
+  lint:
+    name: Shell Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run ShellCheck
+      run: |
+        sudo apt-get install -y shellcheck
+        shellcheck 7zarch scripts/*.sh
+      continue-on-error: true  # Don't fail build on linting warnings

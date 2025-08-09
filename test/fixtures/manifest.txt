@@ -1,0 +1,2 @@
+# Example manifest file for batch processing
+/Users/adamstacoviak/Code/7zarch/test/fixtures/sample-dir

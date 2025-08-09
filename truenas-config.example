@@ -1,20 +1,26 @@
 # TrueNAS Scale Configuration for 7zarch script
-# Generated on 2025-08-07
+# Copy this file to ~/.truenas-config and edit with your actual values
 
 # Connection priority (tries in order until one works)
-TRUENAS_HOST_LOCAL=192.168.100.66
-TRUENAS_HOST_TAILSCALE=truenas-homelab.alai-in.ts.net  # Personal tailnet
-TRUENAS_HOST_CHANGELOG=truenas-changelog  # Changelog org tailnet
+TRUENAS_HOST_LOCAL=192.168.1.100                    # Your TrueNAS local IP
+TRUENAS_HOST_TAILSCALE=truenas-homelab.your-tailnet.ts.net  # Personal tailnet
+TRUENAS_HOST_ORG=truenas-org.your-org-tailnet.ts.net # Organization tailnet hostname (example: google)
 
-TRUENAS_API_KEY=1-evPnT6PQ5bd2AHbEsHNGMLRtXIZzKtBf1LZSG03FF7LSzCMVXpuDUk02Fw2gEHW2
-TRUENAS_PROTOCOL=http
+# Tailnet aliases - map custom names to standard ones
+TAILNET_ALIASES="google:org,work:org,company:org"    # Optional: alias custom names to org
+
+TRUENAS_API_KEY=your-api-key-here                    # Get from TrueNAS Scale > Credentials > API Keys
+TRUENAS_PROTOCOL=http                                # or https if you have certificates
+
+# TrueNAS paths
+TRUENAS_BASE_PATH=/mnt/data/archives                 # Base directory for archives on TrueNAS
 
 # SSH configuration
-TRUENAS_SSH_USER=adamstacoviak
+TRUENAS_SSH_USER=your-username                       # Your SSH username
 
 # Tailscale setup instructions:
 # 1. Install Tailscale app in TrueNAS Scale
 # 2. Get auth key from https://login.tailscale.com/admin/settings/keys
-# 3. Set hostname (e.g., truenas-personal, truenas-changelog)
+# 3. Set hostname (e.g., truenas-personal, truenas-google)
 # 4. Once connected, replace TRUENAS_HOST above with your .ts.net hostname
-# 5. Test: ssh adamstacoviak@truenas-personal.ts.net
+# 5. Test: ssh your-username@truenas-personal.ts.net

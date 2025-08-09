@@ -195,38 +195,44 @@ find_working_host() {
   
   # Build array of hosts to try in priority order
   if [[ -n "$tailnet_name" ]]; then
-    # Specific tailnet requested
-    log_verbose "Using specific tailnet: $tailnet_name"
-    case "$tailnet_name" in
+    # Specific tailnet requested - check for aliases first
+    local resolved_tailnet="$tailnet_name"
+    if [[ -n "${TAILNET_ALIASES:-}" ]]; then
+      # Parse aliases like "google:org,work:org"
+      IFS=',' read -ra aliases <<< "$TAILNET_ALIASES"
+      for alias in "${aliases[@]}"; do
+        IFS=':' read -ra parts <<< "$alias"
+        if [[ "${parts[0]}" == "$tailnet_name" && -n "${parts[1]}" ]]; then
+          resolved_tailnet="${parts[1]}"
+          log_verbose "Resolved tailnet alias '$tailnet_name' -> '$resolved_tailnet'"
+          break
+        fi
+      done
+    fi
+    
+    log_verbose "Using tailnet: $resolved_tailnet"
+    case "$resolved_tailnet" in
       personal)
         [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && hosts+=("$TRUENAS_HOST_TAILSCALE")
         ;;
-      changelog)
-        [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && hosts+=("$TRUENAS_HOST_CHANGELOG")
+      org)
+        [[ -n "${TRUENAS_HOST_ORG:-}" ]] && hosts+=("$TRUENAS_HOST_ORG")
         ;;
       *)
-        # Try to map generic name to variable (e.g., TRUENAS_HOST_MYORG)
-        local var_name="TRUENAS_HOST_$(echo "$tailnet_name" | tr '[:lower:]' '[:upper:]')"
-        local host_value="${!var_name:-}"
-        if [[ -n "$host_value" ]]; then
-          hosts+=("$host_value")
-        else
-          echo "Error: Unknown tailnet '$tailnet_name'. Available: personal, changelog"
-          echo "Or add $var_name to ~/.truenas-config"
-          return 1
-        fi
+        echo "Error: Unknown tailnet '$tailnet_name'. Available: personal, org"
+        return 1
         ;;
     esac
   elif [[ "$force_tailscale" == "true" ]]; then
     # Force Tailscale: skip local, try all Tailscale hosts
     log_verbose "Forcing Tailscale connection (--tailscale flag used)"
     [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && hosts+=("$TRUENAS_HOST_TAILSCALE")
-    [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && hosts+=("$TRUENAS_HOST_CHANGELOG")
+    [[ -n "${TRUENAS_HOST_ORG:-}" ]] && hosts+=("$TRUENAS_HOST_ORG")
   else
     # Normal priority: local first, then Tailscale
     [[ -n "${TRUENAS_HOST_LOCAL:-}" ]] && hosts+=("$TRUENAS_HOST_LOCAL")
     [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && hosts+=("$TRUENAS_HOST_TAILSCALE")
-    [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && hosts+=("$TRUENAS_HOST_CHANGELOG")
+    [[ -n "${TRUENAS_HOST_ORG:-}" ]] && hosts+=("$TRUENAS_HOST_ORG")
   fi
   
   # If legacy TRUENAS_HOST is set, use it as fallback
@@ -253,10 +259,12 @@ load_truenas_config() {
   # Set defaults
   TRUENAS_HOST_LOCAL=""
   TRUENAS_HOST_TAILSCALE=""
-  TRUENAS_HOST_CHANGELOG=""
+  TRUENAS_HOST_ORG=""
   TRUENAS_HOST=""
   TRUENAS_API_KEY=""
   TRUENAS_PROTOCOL="http"
+  TRUENAS_BASE_PATH="/mnt/data/archives"
+  TAILNET_ALIASES=""
   
   # Load from config file if exists
   if [[ -f "$config_file" ]]; then
@@ -271,7 +279,7 @@ load_truenas_config() {
       echo "Tried:"
       [[ -n "${TRUENAS_HOST_LOCAL:-}" ]] && echo "  Local: $TRUENAS_HOST_LOCAL"
       [[ -n "${TRUENAS_HOST_TAILSCALE:-}" ]] && echo "  Tailscale: $TRUENAS_HOST_TAILSCALE"
-      [[ -n "${TRUENAS_HOST_CHANGELOG:-}" ]] && echo "  Changelog: $TRUENAS_HOST_CHANGELOG"
+      [[ -n "${TRUENAS_HOST_ORG:-}" ]] && echo "  Org: $TRUENAS_HOST_ORG"
       return 1
     else
       log_verbose "Using TrueNAS host: $TRUENAS_HOST"
@@ -279,7 +287,7 @@ load_truenas_config() {
   else
     echo "Warning: No TrueNAS config found at $config_file"
     echo "Please create config file with:"
-    echo "  TRUENAS_HOST_LOCAL=192.168.100.66"
+    echo "  TRUENAS_HOST_LOCAL=192.168.1.100"
     echo "  TRUENAS_HOST_TAILSCALE=your-tailscale-host.ts.net"
     echo "  TRUENAS_API_KEY=your-api-key-here"
     echo "  TRUENAS_PROTOCOL=http"
@@ -696,8 +704,8 @@ show_help() {
   echo "  --list-uploads [PATH] Show all archives stored on TrueNAS (absolute or relative path)"
   echo "  --force               Force upload, overwrite existing files without prompting"
   echo "  --tailscale           Force use of Tailscale connection (skip local network)"
-  echo "  --tailnet NAME        Use specific tailnet (personal, changelog, etc.)"
-  echo "  --truenas-path PATH   Custom base path on TrueNAS (default: /mnt/tanker/chlg/changelog)"
+  echo "  --tailnet NAME        Use specific tailnet (personal, org, etc.)"
+  echo "  --truenas-path PATH   Custom base path on TrueNAS (default from config: TRUENAS_BASE_PATH)"
   echo "  --info FILE           Show information about existing archive"
   echo "  --list FILE           List contents of archive (files inside)"
   echo "  --test FILE           Test archive integrity only"
@@ -715,12 +723,12 @@ show_help() {
   echo "  7zarch --upload-truenas /path/to/archive.7z --force"
   echo "  7zarch --list-uploads"
   echo "  7zarch --list-uploads friends/2025"
-  echo "  7zarch --list-uploads /mnt/tanker/chlg/changelog/friends"
+  echo "  7zarch --list-uploads /mnt/data/archives/foo"
   echo "  7zarch --list-uploads --tailscale"
   echo "  7zarch --list-uploads --tailnet personal"
-  echo "  7zarch --list-uploads --tailnet changelog"
+  echo "  7zarch --list-uploads --tailnet org"
   echo "  7zarch --info /path/to/archive.7z"
-  echo "  7zarch --list changelog--test.7z"
+  echo "  7zarch --list test-archive.7z"
 }
 
 # Function to handle termination signals
@@ -1438,7 +1446,7 @@ force_tailscale=false
 tailnet_name=""
 list_uploads_mode=false
 list_uploads_path=""
-truenas_path="/mnt/tanker/chlg/changelog"
+truenas_path="$TRUENAS_BASE_PATH"
 info_mode=false
 list_mode=false
 test_mode=false
@@ -1544,7 +1552,7 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --tailnet)
       if [[ -z "$2" ]]; then
-        echo "Error: --tailnet requires a tailnet name (personal, changelog, etc.)"
+        echo "Error: --tailnet requires a tailnet name (personal, org, etc.)"
         exit 1
       fi
       tailnet_name="$2"

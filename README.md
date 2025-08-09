@@ -47,9 +47,9 @@ A comprehensive command-line tool for creating, managing, and uploading 7z archi
 Copy `truenas-config.example` to `~/.truenas-config` and customize:
 
 ```bash
-TRUENAS_HOST_LOCAL=192.168.100.66
-TRUENAS_HOST_TAILSCALE=truenas-homelab.alai-in.ts.net
-TRUENAS_HOST_CHANGELOG=truenas-changelog
+TRUENAS_HOST_LOCAL=192.168.1.100
+TRUENAS_HOST_TAILSCALE=truenas-homelab.your-tailnet.ts.net
+TRUENAS_HOST_ORG=truenas-org.your-org-tailnet.ts.net
 TRUENAS_API_KEY=your-api-key
 TRUENAS_SSH_USER=your-username
 ```

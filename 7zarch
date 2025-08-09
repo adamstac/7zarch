@@ -314,7 +314,7 @@ test_truenas_connection() {
   log_verbose "Testing TrueNAS connection to $TRUENAS_HOST"
   
   local response
-  response=$(curl -s -w "%{http_code}" \
+  response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
     -H "Authorization: Bearer $TRUENAS_API_KEY" \
     "$TRUENAS_PROTOCOL://$TRUENAS_HOST/api/v2.0/system/info" 2>/dev/null)
   
@@ -355,7 +355,7 @@ create_truenas_directory() {
   
   # Create directory using correct API (no mode parameter)
   local response
-  response=$(curl -s -w "%{http_code}" \
+  response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
     -H "Authorization: Bearer $TRUENAS_API_KEY" \
     -H "Content-Type: application/json" \
     -X POST \
@@ -397,14 +397,14 @@ upload_to_truenas() {
     log_verbose "Using rsync for large file upload"
     
     # Create remote directory first via SSH
-    ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+    ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
         "mkdir -p '$(dirname "$remote_path")'" >/dev/null 2>&1
     
     # Skip smart checking if --force is used
     if [[ "$force_upload" != "true" ]]; then
       # Check if remote file exists and compare
       local remote_stat
-      remote_stat=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+      remote_stat=$(ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
           "stat -c '%s %Y' '$remote_path' 2>/dev/null" 2>/dev/null)
       
       if [[ -n "$remote_stat" ]]; then
@@ -464,7 +464,7 @@ upload_to_truenas() {
   
   # Use multipart upload for the API
   local response
-  response=$(curl -s -w "%{http_code}" \
+  response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
     -H "Authorization: Bearer $TRUENAS_API_KEY" \
     -X POST \
     -F "file=@$local_file" \
@@ -501,7 +501,7 @@ verify_truenas_file() {
     log_verbose "Using SSH for file verification"
     
     local remote_size
-    remote_size=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+    remote_size=$(ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
       "stat -c%s '$remote_path' 2>/dev/null" 2>/dev/null)
     
     if [[ -n "$remote_size" ]] && [[ "$remote_size" =~ ^[0-9]+$ ]]; then
@@ -520,7 +520,7 @@ verify_truenas_file() {
   
   # Fallback to API method
   local response
-  response=$(curl -s -w "%{http_code}" \
+  response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
     -H "Authorization: Bearer $TRUENAS_API_KEY" \
     -X POST \
     -H "Content-Type: application/json" \
@@ -560,7 +560,7 @@ list_truenas_uploads() {
     # Note: Host connection already tested by find_working_host(), so we trust it
     
     # Check if the base directory exists
-    if ! ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+    if ! ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
          "test -d \"$search_path\"" 2>/dev/null; then
       echo "Base directory not found on TrueNAS: $search_path"
       echo "Create the directory first or check your path"
@@ -572,7 +572,7 @@ list_truenas_uploads() {
     
     # Get file listing with sizes and dates
     local file_list
-    file_list=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+    file_list=$(ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
       "find '$search_path' -type f \( -name '*.7z' -o -name '*.log' -o -name '*.checksums' \) -exec ls -lh {} \; 2>/dev/null | sort -k9")
     
     if [[ -z "$file_list" ]]; then
@@ -611,7 +611,7 @@ list_truenas_uploads() {
     
     # Show directory structure if there are subdirectories
     local dir_list
-    dir_list=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+    dir_list=$(ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
       "find '$search_path' -maxdepth 1 -type d ! -path '$search_path' -exec basename {} \; 2>/dev/null | sort")
     
     if [[ -n "$dir_list" ]]; then
@@ -620,7 +620,7 @@ list_truenas_uploads() {
       echo "$dir_list" | while IFS= read -r dir; do
         if [[ -n "$dir" ]]; then
           local dir_count
-          dir_count=$(ssh -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
+          dir_count=$(ssh -o ConnectTimeout=10 -o LogLevel=ERROR "${TRUENAS_SSH_USER}@${TRUENAS_HOST}" \
             "find '$search_path/$dir' -name '*.7z' -type f 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
           printf "  %-20s (%s archives)\n" "$dir" "$dir_count"
         fi
@@ -641,7 +641,7 @@ list_truenas_uploads() {
     
     # Use API to list directory contents
     local response
-    response=$(curl -s -w "%{http_code}" \
+    response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" \
       -H "Authorization: Bearer $TRUENAS_API_KEY" \
       -X POST \
       -H "Content-Type: application/json" \
